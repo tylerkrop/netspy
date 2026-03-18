@@ -370,14 +370,16 @@ fn run_loop(
             let chunks = Layout::vertical([
                 Constraint::Length(1), // title bar
                 Constraint::Min(0),    // table
+                Constraint::Length(1), // bottom bar
             ])
             .split(area);
 
-            let left = if let Some(ref input) = threshold_input {
+            // Top bar: status info
+            let top_left = if let Some(ref input) = threshold_input {
                 format!(" threshold: {}▏", input)
             } else {
                 format!(
-                    " netspy — {} | {} IPs | j/k g/G scroll, t threshold, i ifaces, q quit",
+                    " netspy — {} | {} IPs",
                     iface_display, total
                 )
             };
@@ -388,12 +390,20 @@ fn run_loop(
             };
             let right = format!("{}poll: {}s ", threshold_label, draw_interval.as_secs());
             let bar_width = area.width as usize;
-            let pad = bar_width.saturating_sub(left.len() + right.len());
-            let title = format!("{}{:pad$}{}", left, "", right, pad = pad);
+            let pad = bar_width.saturating_sub(top_left.len() + right.len());
+            let title = format!("{}{:pad$}{}", top_left, "", right, pad = pad);
             f.render_widget(
                 ratatui::widgets::Paragraph::new(title)
                     .style(Style::default().fg(Color::Black).bg(Color::Cyan)),
                 chunks[0],
+            );
+
+            // Bottom bar: hotkey hints
+            let hints = " j/k scroll | g/G top/bottom | t threshold | i ifaces | q quit";
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(hints)
+                    .style(Style::default().fg(Color::Black).bg(Color::Cyan)),
+                chunks[2],
             );
 
             let header = Row::new(vec!["Destination IP", "Packets", "Hostname", "Source"])
