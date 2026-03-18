@@ -123,10 +123,14 @@ fn run_loop(
                     if let Some(mappings) = parse_dns_answers(packet.data) {
                         for (ip, hostname) in mappings {
                             dns_map.insert(ip, hostname.clone());
-                            if let Some(entry) = dest_ips.get_mut(&ip) {
-                                entry.hostname = hostname;
-                                entry.mapping = "dns";
-                            }
+                            // Add or update dest_ips immediately so DNS results are visible
+                            let entry = dest_ips.entry(ip).or_insert(IpEntry {
+                                packets: 0,
+                                hostname: hostname.clone(),
+                                mapping: "dns",
+                            });
+                            entry.hostname = hostname;
+                            entry.mapping = "dns";
                         }
                     }
 
