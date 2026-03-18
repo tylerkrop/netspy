@@ -2,7 +2,7 @@ use pcap::{Capture, Device};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -31,8 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cap = Capture::from_device(device)?
         .promisc(true)
         .snaplen(65535)
-        .timeout(50) // short timeout so TUI stays responsive
-        .open()?;
+        .timeout(1)
+        .open()?
+        .setnonblock()?;
 
     // Enter raw mode / alternate screen
     terminal::enable_raw_mode()?;
@@ -92,6 +93,13 @@ fn run_loop(
     scroll_offset: &mut usize,
     device_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_draw = Instant::now();
+    let draw_interval = Duration::from_secs(1);
+    let mut needs_redraw = true;
+    let mut needs_data_refresh = true;
+    // Cached sorted snapshot for rendering
+    let mut cached_rows: Vec<(IpAddr, IpEntry)> = Vec::new();
+
     loop {
         // Poll for keyboard input (non-blocking)
         if event::poll(Duration::from_millis(0))? {
@@ -103,21 +111,27 @@ fn run_loop(
                     KeyCode::Char('q') => break,
                     KeyCode::Char('j') | KeyCode::Down => {
                         *scroll_offset = scroll_offset.saturating_add(1);
+                        needs_redraw = true;
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         *scroll_offset = scroll_offset.saturating_sub(1);
+                        needs_redraw = true;
                     }
-                    KeyCode::Char('g') => *scroll_offset = 0,
+                    KeyCode::Char('g') => {
+                        *scroll_offset = 0;
+                        needs_redraw = true;
+                    }
                     KeyCode::Char('G') => {
                         *scroll_offset = dest_ips.len().saturating_sub(1);
+                        needs_redraw = true;
                     }
                     _ => {}
                 }
             }
         }
 
-        // Read packets in a small batch before redrawing
-        for _ in 0..64 {
+        // Read all available packets (non-blocking)
+        loop {
             match cap.next_packet() {
                 Ok(packet) => {
                     if let Some(mappings) = parse_dns_answers(packet.data) {
@@ -161,11 +175,31 @@ fn run_loop(
             }
         }
 
-        // Build sorted rows
-        let mut sorted: Vec<_> = dest_ips.iter().collect();
-        sorted.sort_by(|a, b| b.1.packets.cmp(&a.1.packets));
+        // Only redraw on key input or once per second
+        let now = Instant::now();
+        let timer_tick = now.duration_since(last_draw) >= draw_interval;
+        if timer_tick {
+            needs_data_refresh = true;
+            needs_redraw = true;
+        }
+        if !needs_redraw {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        needs_redraw = false;
 
-        let total = sorted.len();
+        // Rebuild sorted data only on timer ticks, not on key input
+        if needs_data_refresh {
+            needs_data_refresh = false;
+            last_draw = now;
+            cached_rows = dest_ips
+                .iter()
+                .map(|(ip, entry)| (*ip, entry.clone()))
+                .collect();
+            cached_rows.sort_by(|a, b| b.1.packets.cmp(&a.1.packets));
+        }
+
+        let total = cached_rows.len();
 
         // Clamp scroll offset
         if total > 0 {
@@ -177,7 +211,7 @@ fn run_loop(
             table_state.select(Some(*scroll_offset));
         }
 
-        let rows: Vec<Row> = sorted
+        let rows: Vec<Row> = cached_rows
             .iter()
             .map(|(ip, entry)| {
                 Row::new(vec![
@@ -198,10 +232,14 @@ fn run_loop(
             ])
             .split(area);
 
-            let title = format!(
+            let left = format!(
                 " netspy — {} | {} IPs | j/k scroll, g/G top/bottom, q quit",
                 device_name, total
             );
+            let right = format!("poll: {}s ", draw_interval.as_secs());
+            let bar_width = area.width as usize;
+            let pad = bar_width.saturating_sub(left.len() + right.len());
+            let title = format!("{}{:pad$}{}", left, "", right, pad = pad);
             f.render_widget(
                 ratatui::widgets::Paragraph::new(title)
                     .style(Style::default().fg(Color::Black).bg(Color::Cyan)),
