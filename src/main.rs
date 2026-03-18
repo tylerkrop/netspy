@@ -24,16 +24,25 @@ struct IpEntry {
     mapping: &'static str, // "dns" or "manual"
 }
 
+fn is_loopback_device(name: &str) -> bool {
+    // Check against known loopback names across platforms
+    name == "lo0" || name == "lo"
+}
+
+fn find_loopback_name() -> Option<String> {
+    Device::list().ok()?.into_iter().find(|d| is_loopback_device(&d.name)).map(|d| d.name)
+}
+
 fn open_captures(selected: &BTreeSet<String>) -> Result<Vec<Capture<pcap::Active>>, Box<dyn std::error::Error>> {
     let mut captures = Vec::new();
     let all_devices = Device::list()?;
     for dev in all_devices {
         if selected.contains(&dev.name) {
-            let is_loopback = dev.name == "lo0";
+            let loopback = is_loopback_device(&dev.name);
             let mut builder = Capture::from_device(dev)?
                 .snaplen(65535)
                 .timeout(1);
-            if !is_loopback {
+            if !loopback {
                 builder = builder.promisc(true);
             }
             captures.push(builder.open()?.setnonblock()?);
@@ -53,8 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut selected_ifaces: BTreeSet<String> = BTreeSet::new();
     selected_ifaces.insert(default_name.clone());
-    if default_name != "lo0" && all_iface_names.contains(&"lo0".to_string()) {
-        selected_ifaces.insert("lo0".to_string());
+    if !is_loopback_device(&default_name) {
+        if let Some(lo_name) = find_loopback_name() {
+            selected_ifaces.insert(lo_name);
+        }
     }
 
     let mut captures = open_captures(&selected_ifaces)?;
@@ -241,36 +252,29 @@ fn run_loop(
             match cap.next_packet() {
                 Ok(packet) => {
                     let data = packet.data;
-                    // Parse based on link type
-                    let frame = match link_type {
-                        pcap::Linktype::ETHERNET => Some(data),
-                        pcap::Linktype::NULL => {
-                            // BSD loopback: 4-byte header with AF family
-                            if data.len() >= 4 {
-                                Some(data)
-                            } else {
-                                None
-                            }
-                        }
+
+                    // Try to parse DNS answers from the packet
+                    let dns_mappings = match link_type {
+                        pcap::Linktype::ETHERNET => parse_dns_answers(data),
+                        pcap::Linktype::NULL => parse_dns_answers_loopback(data),
                         _ => None,
                     };
-                    let Some(frame) = frame else { continue };
-
-                    if link_type == pcap::Linktype::ETHERNET {
-                        if let Some(mappings) = parse_dns_answers(frame) {
-                            for (ip, hostname) in mappings {
-                                dns_map.insert(ip, hostname.clone());
-                                let entry = dest_ips.entry(ip).or_insert(IpEntry {
-                                    packets: 0,
-                                    hostname: hostname.clone(),
-                                    mapping: "dns",
-                                });
-                                entry.hostname = hostname;
-                                entry.mapping = "dns";
-                            }
+                    if let Some(mappings) = dns_mappings {
+                        for (ip, hostname) in mappings {
+                            dns_map.insert(ip, hostname.clone());
+                            let entry = dest_ips.entry(ip).or_insert(IpEntry {
+                                packets: 0,
+                                hostname: hostname.clone(),
+                                mapping: "dns",
+                            });
+                            entry.hostname = hostname;
+                            entry.mapping = "dns";
                         }
+                    }
 
-                        if let Some(dest) = parse_dest_ip(frame) {
+                    // Only count destination IPs from ethernet frames (not loopback-internal traffic)
+                    if link_type == pcap::Linktype::ETHERNET {
+                        if let Some(dest) = parse_dest_ip(data) {
                             let dns = dns_map.clone();
                             let entry = dest_ips.entry(dest).or_insert_with(|| {
                                 if let Some(name) = dns.get(&dest) {
@@ -290,20 +294,6 @@ fn run_loop(
                                 }
                             });
                             entry.packets += 1;
-                        }
-                    } else {
-                        // Loopback: only extract DNS answers
-                        if let Some(mappings) = parse_dns_answers_loopback(frame) {
-                            for (ip, hostname) in mappings {
-                                dns_map.insert(ip, hostname.clone());
-                                let entry = dest_ips.entry(ip).or_insert(IpEntry {
-                                    packets: 0,
-                                    hostname: hostname.clone(),
-                                    mapping: "dns",
-                                });
-                                entry.hostname = hostname;
-                                entry.mapping = "dns";
-                            }
                         }
                     }
                 }
