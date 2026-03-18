@@ -28,12 +28,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::lookup()?.expect("No default device found");
     let device_name = device.name.clone();
 
-    let mut cap = Capture::from_device(device)?
-        .promisc(true)
-        .snaplen(65535)
-        .timeout(1)
-        .open()?
-        .setnonblock()?;
+    let mut captures: Vec<Capture<pcap::Active>> = Vec::new();
+    let mut iface_names: Vec<String> = Vec::new();
+
+    // Open capture on the default device
+    iface_names.push(device_name.clone());
+    captures.push(
+        Capture::from_device(device)?
+            .promisc(true)
+            .snaplen(65535)
+            .timeout(1)
+            .open()?
+            .setnonblock()?,
+    );
+
+    // Also capture on loopback for local DNS traffic
+    if device_name != "lo0" {
+        if let Some(lo) = Device::list()?.into_iter().find(|d| d.name == "lo0") {
+            iface_names.push("lo0".to_string());
+            captures.push(
+                Capture::from_device(lo)?
+                    .snaplen(65535)
+                    .timeout(1)
+                    .open()?
+                    .setnonblock()?,
+            );
+        }
+    }
+
+    let iface_display = iface_names.join(",");
 
     // Enter raw mode / alternate screen
     terminal::enable_raw_mode()?;
@@ -48,13 +71,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut scroll_offset: usize = 0;
 
     let result = run_loop(
-        &mut cap,
+        &mut captures,
         &mut terminal,
         &mut dest_ips,
         &mut dns_map,
         &mut table_state,
         &mut scroll_offset,
-        &device_name,
+        &iface_display,
     );
 
     // Restore terminal
@@ -85,13 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_loop(
-    cap: &mut Capture<pcap::Active>,
+    captures: &mut Vec<Capture<pcap::Active>>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     dest_ips: &mut BTreeMap<IpAddr, IpEntry>,
     dns_map: &mut BTreeMap<IpAddr, String>,
     table_state: &mut TableState,
     scroll_offset: &mut usize,
-    device_name: &str,
+    iface_display: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_draw = Instant::now();
     let draw_interval = Duration::from_secs(1);
@@ -161,48 +184,82 @@ fn run_loop(
             }
         }
 
-        // Read all available packets (non-blocking)
-        loop {
+        // Read all available packets from all captures (non-blocking)
+        for cap in captures.iter_mut() {
+            let link_type = cap.get_datalink();
+            loop {
             match cap.next_packet() {
                 Ok(packet) => {
-                    if let Some(mappings) = parse_dns_answers(packet.data) {
-                        for (ip, hostname) in mappings {
-                            dns_map.insert(ip, hostname.clone());
-                            // Add or update dest_ips immediately so DNS results are visible
-                            let entry = dest_ips.entry(ip).or_insert(IpEntry {
-                                packets: 0,
-                                hostname: hostname.clone(),
-                                mapping: "dns",
-                            });
-                            entry.hostname = hostname;
-                            entry.mapping = "dns";
-                        }
-                    }
-
-                    if let Some(dest) = parse_dest_ip(packet.data) {
-                        let dns = dns_map.clone();
-                        let entry = dest_ips.entry(dest).or_insert_with(|| {
-                            if let Some(name) = dns.get(&dest) {
-                                IpEntry {
-                                    packets: 0,
-                                    hostname: name.clone(),
-                                    mapping: "dns",
-                                }
+                    let data = packet.data;
+                    // Parse based on link type
+                    let frame = match link_type {
+                        pcap::Linktype::ETHERNET => Some(data),
+                        pcap::Linktype::NULL => {
+                            // BSD loopback: 4-byte header with AF family
+                            if data.len() >= 4 {
+                                Some(data)
                             } else {
-                                let hostname = dns_lookup::lookup_addr(&dest)
-                                    .unwrap_or_else(|_| dest.to_string());
-                                IpEntry {
-                                    packets: 0,
-                                    hostname,
-                                    mapping: "manual",
-                                }
+                                None
                             }
-                        });
-                        entry.packets += 1;
+                        }
+                        _ => None,
+                    };
+                    let Some(frame) = frame else { continue };
+
+                    if link_type == pcap::Linktype::ETHERNET {
+                        if let Some(mappings) = parse_dns_answers(frame) {
+                            for (ip, hostname) in mappings {
+                                dns_map.insert(ip, hostname.clone());
+                                let entry = dest_ips.entry(ip).or_insert(IpEntry {
+                                    packets: 0,
+                                    hostname: hostname.clone(),
+                                    mapping: "dns",
+                                });
+                                entry.hostname = hostname;
+                                entry.mapping = "dns";
+                            }
+                        }
+
+                        if let Some(dest) = parse_dest_ip(frame) {
+                            let dns = dns_map.clone();
+                            let entry = dest_ips.entry(dest).or_insert_with(|| {
+                                if let Some(name) = dns.get(&dest) {
+                                    IpEntry {
+                                        packets: 0,
+                                        hostname: name.clone(),
+                                        mapping: "dns",
+                                    }
+                                } else {
+                                    let hostname = dns_lookup::lookup_addr(&dest)
+                                        .unwrap_or_else(|_| dest.to_string());
+                                    IpEntry {
+                                        packets: 0,
+                                        hostname,
+                                        mapping: "manual",
+                                    }
+                                }
+                            });
+                            entry.packets += 1;
+                        }
+                    } else {
+                        // Loopback: only extract DNS answers
+                        if let Some(mappings) = parse_dns_answers_loopback(frame) {
+                            for (ip, hostname) in mappings {
+                                dns_map.insert(ip, hostname.clone());
+                                let entry = dest_ips.entry(ip).or_insert(IpEntry {
+                                    packets: 0,
+                                    hostname: hostname.clone(),
+                                    mapping: "dns",
+                                });
+                                entry.hostname = hostname;
+                                entry.mapping = "dns";
+                            }
+                        }
                     }
                 }
                 Err(pcap::Error::TimeoutExpired) => break,
                 Err(e) => return Err(e.into()),
+            }
             }
         }
 
@@ -271,7 +328,7 @@ fn run_loop(
             } else {
                 format!(
                     " netspy — {} | {} IPs | j/k scroll, g/G top/bottom, t threshold, q quit",
-                    device_name, total
+                    iface_display, total
                 )
             };
             let threshold_label = if threshold > 0 {
@@ -354,29 +411,46 @@ fn parse_dns_answers(data: &[u8]) -> Option<Vec<(IpAddr, String)>> {
         return None;
     }
     let ethertype = u16::from_be_bytes([data[12], data[13]]);
+    let ip_start = 14;
+    find_and_parse_dns(data, ip_start, ethertype)
+}
 
-    // Determine IP header length and check for UDP protocol
+/// Parse DNS answers from BSD loopback frames (4-byte AF header).
+fn parse_dns_answers_loopback(data: &[u8]) -> Option<Vec<(IpAddr, String)>> {
+    if data.len() < 4 {
+        return None;
+    }
+    let af = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+    let ethertype = match af {
+        2 => 0x0800u16,  // AF_INET
+        30 => 0x86DDu16, // AF_INET6 on macOS
+        _ => return None,
+    };
+    find_and_parse_dns(data, 4, ethertype)
+}
+
+fn find_and_parse_dns(data: &[u8], ip_start: usize, ethertype: u16) -> Option<Vec<(IpAddr, String)>> {
     let udp_start = match ethertype {
         0x0800 => {
-            if data.len() < 14 + 20 {
+            if data.len() < ip_start + 20 {
                 return None;
             }
-            let ihl = (data[14] & 0x0F) as usize * 4;
-            let protocol = data[14 + 9];
+            let ihl = (data[ip_start] & 0x0F) as usize * 4;
+            let protocol = data[ip_start + 9];
             if protocol != 17 {
-                return None; // not UDP
+                return None;
             }
-            14 + ihl
+            ip_start + ihl
         }
         0x86DD => {
-            if data.len() < 14 + 40 {
+            if data.len() < ip_start + 40 {
                 return None;
             }
-            let next_header = data[14 + 6];
+            let next_header = data[ip_start + 6];
             if next_header != 17 {
-                return None; // not UDP (simplified, ignores extension headers)
+                return None;
             }
-            14 + 40
+            ip_start + 40
         }
         _ => return None,
     };
@@ -385,7 +459,6 @@ fn parse_dns_answers(data: &[u8]) -> Option<Vec<(IpAddr, String)>> {
         return None;
     }
     let src_port = u16::from_be_bytes([data[udp_start], data[udp_start + 1]]);
-    // DNS responses come from port 53
     if src_port != 53 {
         return None;
     }
