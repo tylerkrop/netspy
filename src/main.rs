@@ -1,5 +1,5 @@
 use pcap::{Capture, Device};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
@@ -11,9 +11,9 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Row, Table, TableState},
     Terminal,
 };
 
@@ -24,39 +24,41 @@ struct IpEntry {
     mapping: &'static str, // "dns" or "manual"
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = Device::lookup()?.expect("No default device found");
-    let device_name = device.name.clone();
-
-    let mut captures: Vec<Capture<pcap::Active>> = Vec::new();
-    let mut iface_names: Vec<String> = Vec::new();
-
-    // Open capture on the default device
-    iface_names.push(device_name.clone());
-    captures.push(
-        Capture::from_device(device)?
-            .promisc(true)
-            .snaplen(65535)
-            .timeout(1)
-            .open()?
-            .setnonblock()?,
-    );
-
-    // Also capture on loopback for local DNS traffic
-    if device_name != "lo0" {
-        if let Some(lo) = Device::list()?.into_iter().find(|d| d.name == "lo0") {
-            iface_names.push("lo0".to_string());
-            captures.push(
-                Capture::from_device(lo)?
-                    .snaplen(65535)
-                    .timeout(1)
-                    .open()?
-                    .setnonblock()?,
-            );
+fn open_captures(selected: &BTreeSet<String>) -> Result<Vec<Capture<pcap::Active>>, Box<dyn std::error::Error>> {
+    let mut captures = Vec::new();
+    let all_devices = Device::list()?;
+    for dev in all_devices {
+        if selected.contains(&dev.name) {
+            let is_loopback = dev.name == "lo0";
+            let mut builder = Capture::from_device(dev)?
+                .snaplen(65535)
+                .timeout(1);
+            if !is_loopback {
+                builder = builder.promisc(true);
+            }
+            captures.push(builder.open()?.setnonblock()?);
         }
     }
+    Ok(captures)
+}
 
-    let iface_display = iface_names.join(",");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let device = Device::lookup()?.expect("No default device found");
+    let default_name = device.name.clone();
+
+    let all_iface_names: Vec<String> = Device::list()?
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+
+    let mut selected_ifaces: BTreeSet<String> = BTreeSet::new();
+    selected_ifaces.insert(default_name.clone());
+    if default_name != "lo0" && all_iface_names.contains(&"lo0".to_string()) {
+        selected_ifaces.insert("lo0".to_string());
+    }
+
+    let mut captures = open_captures(&selected_ifaces)?;
+    let mut iface_display = selected_ifaces.iter().cloned().collect::<Vec<_>>().join(",");
 
     // Enter raw mode / alternate screen
     terminal::enable_raw_mode()?;
@@ -77,7 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut dns_map,
         &mut table_state,
         &mut scroll_offset,
-        &iface_display,
+        &mut iface_display,
+        &mut selected_ifaces,
+        &all_iface_names,
     );
 
     // Restore terminal
@@ -114,7 +118,9 @@ fn run_loop(
     dns_map: &mut BTreeMap<IpAddr, String>,
     table_state: &mut TableState,
     scroll_offset: &mut usize,
-    iface_display: &str,
+    iface_display: &mut String,
+    selected_ifaces: &mut BTreeSet<String>,
+    all_iface_names: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_draw = Instant::now();
     let draw_interval = Duration::from_secs(1);
@@ -125,11 +131,48 @@ fn run_loop(
     let mut threshold: u64 = 0;
     let mut threshold_input: Option<String> = None; // Some when typing threshold
 
+    // Interface picker state
+    let mut iface_picker: Option<IfacePicker> = None;
+
     loop {
         // Poll for keyboard input (non-blocking)
         if event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
-                if let Some(ref mut input) = threshold_input {
+                if let Some(ref mut picker) = iface_picker {
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            picker.cursor = (picker.cursor + 1).min(all_iface_names.len().saturating_sub(1));
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            picker.cursor = picker.cursor.saturating_sub(1);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(' ') => {
+                            let name = &all_iface_names[picker.cursor];
+                            if picker.selected.contains(name) {
+                                picker.selected.remove(name);
+                            } else {
+                                picker.selected.insert(name.clone());
+                            }
+                            needs_redraw = true;
+                        }
+                        KeyCode::Enter => {
+                            if !picker.selected.is_empty() {
+                                *selected_ifaces = picker.selected.clone();
+                                *captures = open_captures(selected_ifaces)?;
+                                *iface_display = selected_ifaces.iter().cloned().collect::<Vec<_>>().join(",");
+                            }
+                            iface_picker = None;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Esc => {
+                            iface_picker = None;
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if let Some(ref mut input) = threshold_input {
                     // Threshold input mode
                     match key.code {
                         KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -176,6 +219,13 @@ fn run_loop(
                         }
                         KeyCode::Char('t') => {
                             threshold_input = Some(String::new());
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('i') => {
+                            iface_picker = Some(IfacePicker {
+                                cursor: 0,
+                                selected: selected_ifaces.clone(),
+                            });
                             needs_redraw = true;
                         }
                         _ => {}
@@ -327,7 +377,7 @@ fn run_loop(
                 format!(" threshold: {}▏", input)
             } else {
                 format!(
-                    " netspy — {} | {} IPs | j/k scroll, g/G top/bottom, t threshold, q quit",
+                    " netspy — {} | {} IPs | j/k g/G scroll, t threshold, i ifaces, q quit",
                     iface_display, total
                 )
             };
@@ -371,9 +421,60 @@ fn run_loop(
                 );
 
             f.render_stateful_widget(table, chunks[1], table_state);
+
+            // Interface picker overlay
+            if let Some(ref picker) = iface_picker {
+                let picker_height = (all_iface_names.len() + 4).min(area.height as usize) as u16;
+                let picker_width = 50.min(area.width);
+                let x = (area.width.saturating_sub(picker_width)) / 2;
+                let y = (area.height.saturating_sub(picker_height)) / 2;
+                let popup_area = Rect::new(x, y, picker_width, picker_height);
+
+                f.render_widget(Clear, popup_area);
+
+                let picker_block = Block::default()
+                    .title(" Interfaces: j/k move, space toggle, enter apply, esc cancel ")
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(Color::Black));
+
+                let inner = picker_block.inner(popup_area);
+                f.render_widget(picker_block, popup_area);
+
+                let visible_height = inner.height as usize;
+                let picker_scroll = if picker.cursor >= visible_height {
+                    picker.cursor - visible_height + 1
+                } else {
+                    0
+                };
+
+                let lines: Vec<ratatui::text::Line> = all_iface_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let check = if picker.selected.contains(name) { "[x]" } else { "[ ]" };
+                        let style = if i == picker.cursor {
+                            Style::default().fg(Color::Black).bg(Color::White)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        ratatui::text::Line::styled(format!(" {} {}", check, name), style)
+                    })
+                    .collect();
+
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new(lines)
+                        .scroll((picker_scroll as u16, 0)),
+                    inner,
+                );
+            }
         })?;
     }
     Ok(())
+}
+
+struct IfacePicker {
+    cursor: usize,
+    selected: BTreeSet<String>,
 }
 
 /// Parse the destination IP from a raw Ethernet frame.
