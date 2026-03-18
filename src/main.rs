@@ -99,33 +99,64 @@ fn run_loop(
     let mut needs_data_refresh = true;
     // Cached sorted snapshot for rendering
     let mut cached_rows: Vec<(IpAddr, IpEntry)> = Vec::new();
+    let mut threshold: u64 = 0;
+    let mut threshold_input: Option<String> = None; // Some when typing threshold
 
     loop {
         // Poll for keyboard input (non-blocking)
         if event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        break;
+                if let Some(ref mut input) = threshold_input {
+                    // Threshold input mode
+                    match key.code {
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            input.push(c);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Backspace => {
+                            input.pop();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Enter => {
+                            threshold = input.parse().unwrap_or(0);
+                            threshold_input = None;
+                            needs_data_refresh = true;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Esc => {
+                            threshold_input = None;
+                            needs_redraw = true;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        *scroll_offset = scroll_offset.saturating_add(1);
-                        needs_redraw = true;
+                } else {
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            *scroll_offset = scroll_offset.saturating_add(1);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            *scroll_offset = scroll_offset.saturating_sub(1);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('g') => {
+                            *scroll_offset = 0;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('G') => {
+                            *scroll_offset = dest_ips.len().saturating_sub(1);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('t') => {
+                            threshold_input = Some(String::new());
+                            needs_redraw = true;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        *scroll_offset = scroll_offset.saturating_sub(1);
-                        needs_redraw = true;
-                    }
-                    KeyCode::Char('g') => {
-                        *scroll_offset = 0;
-                        needs_redraw = true;
-                    }
-                    KeyCode::Char('G') => {
-                        *scroll_offset = dest_ips.len().saturating_sub(1);
-                        needs_redraw = true;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -197,6 +228,9 @@ fn run_loop(
                 .map(|(ip, entry)| (*ip, entry.clone()))
                 .collect();
             cached_rows.sort_by(|a, b| b.1.packets.cmp(&a.1.packets));
+            if threshold > 0 {
+                cached_rows.retain(|(_ip, entry)| entry.packets >= threshold);
+            }
         }
 
         let total = cached_rows.len();
@@ -232,11 +266,20 @@ fn run_loop(
             ])
             .split(area);
 
-            let left = format!(
-                " netspy — {} | {} IPs | j/k scroll, g/G top/bottom, q quit",
-                device_name, total
-            );
-            let right = format!("poll: {}s ", draw_interval.as_secs());
+            let left = if let Some(ref input) = threshold_input {
+                format!(" threshold: {}▏", input)
+            } else {
+                format!(
+                    " netspy — {} | {} IPs | j/k scroll, g/G top/bottom, t threshold, q quit",
+                    device_name, total
+                )
+            };
+            let threshold_label = if threshold > 0 {
+                format!("min: {} | ", threshold)
+            } else {
+                String::new()
+            };
+            let right = format!("{}poll: {}s ", threshold_label, draw_interval.as_secs());
             let bar_width = area.width as usize;
             let pad = bar_width.saturating_sub(left.len() + right.len());
             let title = format!("{}{:pad$}{}", left, "", right, pad = pad);
