@@ -1,8 +1,21 @@
 use pcap::{Capture, Device};
 use std::collections::BTreeMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::time::Duration;
+
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Layout},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Cell, Row, Table, TableState},
+    Terminal,
+};
 
 #[derive(Clone)]
 struct IpEntry {
@@ -11,83 +24,214 @@ struct IpEntry {
     mapping: &'static str, // "dns" or "manual"
 }
 
-fn main() {
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })
-    .expect("Failed to set Ctrl+C handler");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let device = Device::lookup()?.expect("No default device found");
+    let device_name = device.name.clone();
 
-    let device = Device::lookup()
-        .expect("Failed to look up default device")
-        .expect("No default device found");
-    println!("Capturing on device: {}", device.name);
-
-    let mut cap = Capture::from_device(device)
-        .expect("Failed to open device")
+    let mut cap = Capture::from_device(device)?
         .promisc(true)
-        .snaplen(65535) // full packet for DNS payloads
-        .timeout(100)
-        .open()
-        .expect("Failed to start capture");
+        .snaplen(65535)
+        .timeout(50) // short timeout so TUI stays responsive
+        .open()?;
 
-    // IP -> entry (packets, hostname, mapping type)
+    // Enter raw mode / alternate screen
+    terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
     let mut dest_ips: BTreeMap<IpAddr, IpEntry> = BTreeMap::new();
-    // DNS-learned mappings: IP -> hostname
     let mut dns_map: BTreeMap<IpAddr, String> = BTreeMap::new();
+    let mut table_state = TableState::default();
+    let mut scroll_offset: usize = 0;
 
-    println!("Monitoring outbound destination IPs... Press Ctrl+C to stop.\n");
+    let result = run_loop(
+        &mut cap,
+        &mut terminal,
+        &mut dest_ips,
+        &mut dns_map,
+        &mut table_state,
+        &mut scroll_offset,
+        &device_name,
+    );
 
-    while running.load(Ordering::SeqCst) {
-        match cap.next_packet() {
-            Ok(packet) => {
-                // Try to extract DNS answer records from this packet
-                if let Some(mappings) = parse_dns_answers(packet.data) {
-                    for (ip, hostname) in mappings {
-                        dns_map.insert(ip, hostname.clone());
-                        // Update any existing entry that was "manual" to "dns"
-                        if let Some(entry) = dest_ips.get_mut(&ip) {
-                            entry.hostname = hostname;
-                            entry.mapping = "dns";
-                        }
-                    }
-                }
+    // Restore terminal
+    terminal::disable_raw_mode()?;
+    terminal.backend_mut().execute(LeaveAlternateScreen)?;
 
-                if let Some(dest) = parse_dest_ip(packet.data) {
-                    let entry = dest_ips.entry(dest).or_insert_with(|| {
-                        if let Some(name) = dns_map.get(&dest) {
-                            IpEntry {
-                                packets: 0,
-                                hostname: name.clone(),
-                                mapping: "dns",
-                            }
-                        } else {
-                            // Reverse DNS lookup
-                            let hostname = dns_lookup::lookup_addr(&dest)
-                                .unwrap_or_else(|_| dest.to_string());
-                            IpEntry {
-                                packets: 0,
-                                hostname,
-                                mapping: "manual",
-                            }
-                        }
-                    });
-                    entry.packets += 1;
-                    print_table(&dest_ips);
-                }
-            }
-            Err(pcap::Error::TimeoutExpired) => continue,
-            Err(e) => {
-                eprintln!("Capture error: {e}");
-                break;
-            }
-        }
+    if let Err(e) = result {
+        eprintln!("Error: {e}");
     }
 
-    println!("\n\n--- Final Summary ---");
-    print_table(&dest_ips);
+    // Print final summary to normal stdout
+    let mut sorted: Vec<_> = dest_ips.iter().collect();
+    sorted.sort_by(|a, b| b.1.packets.cmp(&a.1.packets));
+    println!("\n--- Final Summary ---");
+    println!(
+        "{:<45} {:>10}  {:<50} {:<7}",
+        "Destination IP", "Packets", "Hostname", "Source"
+    );
+    for (ip, entry) in &sorted {
+        println!(
+            "{:<45} {:>10}  {:<50} {:<7}",
+            ip, entry.packets, entry.hostname, entry.mapping
+        );
+    }
     println!("\nTotal unique IPs: {}", dest_ips.len());
+
+    Ok(())
+}
+
+fn run_loop(
+    cap: &mut Capture<pcap::Active>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    dest_ips: &mut BTreeMap<IpAddr, IpEntry>,
+    dns_map: &mut BTreeMap<IpAddr, String>,
+    table_state: &mut TableState,
+    scroll_offset: &mut usize,
+    device_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        // Poll for keyboard input (non-blocking)
+        if event::poll(Duration::from_millis(0))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break;
+                    }
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *scroll_offset = scroll_offset.saturating_add(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *scroll_offset = scroll_offset.saturating_sub(1);
+                    }
+                    KeyCode::Char('g') => *scroll_offset = 0,
+                    KeyCode::Char('G') => {
+                        *scroll_offset = dest_ips.len().saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Read packets in a small batch before redrawing
+        for _ in 0..64 {
+            match cap.next_packet() {
+                Ok(packet) => {
+                    if let Some(mappings) = parse_dns_answers(packet.data) {
+                        for (ip, hostname) in mappings {
+                            dns_map.insert(ip, hostname.clone());
+                            if let Some(entry) = dest_ips.get_mut(&ip) {
+                                entry.hostname = hostname;
+                                entry.mapping = "dns";
+                            }
+                        }
+                    }
+
+                    if let Some(dest) = parse_dest_ip(packet.data) {
+                        let dns = dns_map.clone();
+                        let entry = dest_ips.entry(dest).or_insert_with(|| {
+                            if let Some(name) = dns.get(&dest) {
+                                IpEntry {
+                                    packets: 0,
+                                    hostname: name.clone(),
+                                    mapping: "dns",
+                                }
+                            } else {
+                                let hostname = dns_lookup::lookup_addr(&dest)
+                                    .unwrap_or_else(|_| dest.to_string());
+                                IpEntry {
+                                    packets: 0,
+                                    hostname,
+                                    mapping: "manual",
+                                }
+                            }
+                        });
+                        entry.packets += 1;
+                    }
+                }
+                Err(pcap::Error::TimeoutExpired) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Build sorted rows
+        let mut sorted: Vec<_> = dest_ips.iter().collect();
+        sorted.sort_by(|a, b| b.1.packets.cmp(&a.1.packets));
+
+        let total = sorted.len();
+
+        // Clamp scroll offset
+        if total > 0 {
+            *scroll_offset = (*scroll_offset).min(total - 1);
+        }
+
+        // Select the row at scroll_offset so ratatui scrolls the table
+        if total > 0 {
+            table_state.select(Some(*scroll_offset));
+        }
+
+        let rows: Vec<Row> = sorted
+            .iter()
+            .map(|(ip, entry)| {
+                Row::new(vec![
+                    Cell::from(ip.to_string()),
+                    Cell::from(entry.packets.to_string()),
+                    Cell::from(entry.hostname.clone()),
+                    Cell::from(entry.mapping.to_string()),
+                ])
+            })
+            .collect();
+
+        terminal.draw(|f| {
+            let area = f.area();
+
+            let chunks = Layout::vertical([
+                Constraint::Length(1), // title bar
+                Constraint::Min(0),    // table
+            ])
+            .split(area);
+
+            let title = format!(
+                " netspy — {} | {} IPs | j/k scroll, g/G top/bottom, q quit",
+                device_name, total
+            );
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(title)
+                    .style(Style::default().fg(Color::Black).bg(Color::Cyan)),
+                chunks[0],
+            );
+
+            let header = Row::new(vec!["Destination IP", "Packets", "Hostname", "Source"])
+                .style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .bottom_margin(0);
+
+            let widths = [
+                Constraint::Min(20),
+                Constraint::Length(12),
+                Constraint::Min(30),
+                Constraint::Length(8),
+            ];
+
+            let table = Table::new(rows, widths)
+                .header(header)
+                .block(Block::default().borders(Borders::NONE))
+                .row_highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                );
+
+            f.render_stateful_widget(table, chunks[1], table_state);
+        })?;
+    }
+    Ok(())
 }
 
 /// Parse the destination IP from a raw Ethernet frame.
@@ -305,21 +449,4 @@ fn read_dns_name(data: &[u8], start: usize) -> Option<(String, usize)> {
     Some((parts.join("."), end_offset.unwrap_or(offset)))
 }
 
-fn print_table(ips: &BTreeMap<IpAddr, IpEntry>) {
-    let count = ips.len();
-    if count > 0 {
-        print!("\x1b[{}A", count + 1);
-    }
-    print!("\x1b[J");
 
-    println!(
-        "{:<45} {:>10}  {:<50} {:<7}",
-        "Destination IP", "Packets", "Hostname", "Source"
-    );
-    for (ip, entry) in ips {
-        println!(
-            "{:<45} {:>10}  {:<50} {:<7}",
-            ip, entry.packets, entry.hostname, entry.mapping
-        );
-    }
-}
