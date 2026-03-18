@@ -352,6 +352,21 @@ fn run_loop(
             table_state.select(Some(*scroll_offset));
         }
 
+        // Compute column widths from data
+        let ip_width = cached_rows
+            .iter()
+            .map(|(ip, _)| ip.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max("Destination IP".len()) as u16;
+        let pkt_width = cached_rows
+            .iter()
+            .map(|(_, entry)| entry.packets.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max("Packets".len()) as u16;
+        let source_width = "Source".len() as u16;
+
         let rows: Vec<Row> = cached_rows
             .iter()
             .map(|(ip, entry)| {
@@ -415,14 +430,15 @@ fn run_loop(
                 .bottom_margin(0);
 
             let widths = [
-                Constraint::Min(20),
-                Constraint::Length(12),
-                Constraint::Min(30),
-                Constraint::Length(8),
+                Constraint::Length(ip_width),
+                Constraint::Length(pkt_width),
+                Constraint::Min(8),
+                Constraint::Length(source_width),
             ];
 
             let table = Table::new(rows, widths)
                 .header(header)
+                .column_spacing(2)
                 .block(Block::default().borders(Borders::NONE))
                 .row_highlight_style(
                     Style::default()
