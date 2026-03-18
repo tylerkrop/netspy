@@ -45,5 +45,6 @@ The tool automatically selects the default network interface plus loopback. Pres
 | `g`       | Jump to top             |
 | `G`       | Jump to bottom          |
 | `t`       | Set packet threshold    |
+| `p`       | Toggle port column      |
 | `i`       | Open interface picker   |
 | `q`       | Quit                    |

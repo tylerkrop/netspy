@@ -138,12 +138,15 @@ fn run_loop(
     let mut needs_redraw = true;
     let mut needs_data_refresh = true;
     // Cached sorted snapshot for rendering
-    let mut cached_rows: Vec<(IpAddr, IpEntry)> = Vec::new();
+    let mut cached_rows: Vec<(IpAddr, Option<u16>, IpEntry)> = Vec::new();
     let mut threshold: u64 = 0;
     let mut threshold_input: Option<String> = None; // Some when typing threshold
 
     // Interface picker state
     let mut iface_picker: Option<IfacePicker> = None;
+
+    let mut show_ports = false;
+    let mut port_counts: BTreeMap<(IpAddr, u16), u64> = BTreeMap::new();
 
     loop {
         // Poll for keyboard input (non-blocking)
@@ -239,6 +242,11 @@ fn run_loop(
                             });
                             needs_redraw = true;
                         }
+                        KeyCode::Char('p') => {
+                            show_ports = !show_ports;
+                            needs_data_refresh = true;
+                            needs_redraw = true;
+                        }
                         _ => {}
                     }
                 }
@@ -274,7 +282,7 @@ fn run_loop(
 
                     // Only count destination IPs from ethernet frames (not loopback-internal traffic)
                     if link_type == pcap::Linktype::ETHERNET {
-                        if let Some(dest) = parse_dest_ip(data) {
+                        if let Some((dest, port)) = parse_dest_ip(data) {
                             let dns = dns_map.clone();
                             let entry = dest_ips.entry(dest).or_insert_with(|| {
                                 if let Some(name) = dns.get(&dest) {
@@ -294,6 +302,9 @@ fn run_loop(
                                 }
                             });
                             entry.packets += 1;
+                            if let Some(p) = port {
+                                *port_counts.entry((dest, p)).or_insert(0u64) += 1;
+                            }
                         }
                     }
                 }
@@ -320,13 +331,25 @@ fn run_loop(
         if needs_data_refresh {
             needs_data_refresh = false;
             last_draw = now;
-            cached_rows = dest_ips
-                .iter()
-                .map(|(ip, entry)| (*ip, entry.clone()))
-                .collect();
-            cached_rows.sort_by(|a, b| b.1.packets.cmp(&a.1.packets));
+            if show_ports {
+                cached_rows = port_counts
+                    .iter()
+                    .map(|((ip, port), &count)| {
+                        let base = dest_ips.get(ip);
+                        let hostname = base.map(|e| e.hostname.clone()).unwrap_or_default();
+                        let mapping = base.map(|e| e.mapping).unwrap_or("manual");
+                        (*ip, Some(*port), IpEntry { packets: count, hostname, mapping })
+                    })
+                    .collect();
+            } else {
+                cached_rows = dest_ips
+                    .iter()
+                    .map(|(ip, entry)| (*ip, None, entry.clone()))
+                    .collect();
+            }
+            cached_rows.sort_by(|a, b| b.2.packets.cmp(&a.2.packets));
             if threshold > 0 {
-                cached_rows.retain(|(_ip, entry)| entry.packets >= threshold);
+                cached_rows.retain(|(_, _, entry)| entry.packets >= threshold);
             }
         }
 
@@ -345,27 +368,43 @@ fn run_loop(
         // Compute column widths from data
         let ip_width = cached_rows
             .iter()
-            .map(|(ip, _)| ip.to_string().len())
+            .map(|(ip, _, _)| ip.to_string().len())
             .max()
             .unwrap_or(0)
             .max("Destination IP".len()) as u16;
         let pkt_width = cached_rows
             .iter()
-            .map(|(_, entry)| entry.packets.to_string().len())
+            .map(|(_, _, entry)| entry.packets.to_string().len())
             .max()
             .unwrap_or(0)
             .max("Packets".len()) as u16;
         let source_width = "Source".len() as u16;
+        let port_width = if show_ports {
+            cached_rows
+                .iter()
+                .map(|(_, port, _)| port.map(|p| p.to_string().len()).unwrap_or(1))
+                .max()
+                .unwrap_or(0)
+                .max("Port".len()) as u16
+        } else {
+            0
+        };
 
         let rows: Vec<Row> = cached_rows
             .iter()
-            .map(|(ip, entry)| {
-                Row::new(vec![
-                    Cell::from(ip.to_string()),
+            .map(|(ip, port, entry)| {
+                let mut cells = vec![Cell::from(ip.to_string())];
+                if show_ports {
+                    cells.push(Cell::from(
+                        port.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+                    ));
+                }
+                cells.extend([
                     Cell::from(entry.packets.to_string()),
                     Cell::from(entry.hostname.clone()),
                     Cell::from(entry.mapping.to_string()),
-                ])
+                ]);
+                Row::new(cells)
             })
             .collect();
 
@@ -383,10 +422,17 @@ fn run_loop(
             let top_left = if let Some(ref input) = threshold_input {
                 format!(" threshold: {}▏", input)
             } else {
-                format!(
-                    " netspy — {} | {} IPs",
-                    iface_display, total
-                )
+                if show_ports {
+                    format!(
+                        " netspy — {} | {} rows | ports",
+                        iface_display, total
+                    )
+                } else {
+                    format!(
+                        " netspy — {} | {} IPs",
+                        iface_display, total
+                    )
+                }
             };
             let threshold_label = if threshold > 0 {
                 format!("min: {} | ", threshold)
@@ -404,14 +450,19 @@ fn run_loop(
             );
 
             // Bottom bar: hotkey hints
-            let hints = " j/k scroll | g/G top/bottom | t threshold | i ifaces | q quit";
+            let hints = " j/k scroll | g/G top/bottom | t threshold | i ifaces | p ports | q quit";
             f.render_widget(
                 ratatui::widgets::Paragraph::new(hints)
                     .style(Style::default().fg(Color::Black).bg(Color::Cyan)),
                 chunks[2],
             );
 
-            let header = Row::new(vec!["Destination IP", "Packets", "Hostname", "Source"])
+            let mut header_cells = vec!["Destination IP"];
+            if show_ports {
+                header_cells.push("Port");
+            }
+            header_cells.extend(["Packets", "Hostname", "Source"]);
+            let header = Row::new(header_cells)
                 .style(
                     Style::default()
                         .fg(Color::Yellow)
@@ -419,12 +470,15 @@ fn run_loop(
                 )
                 .bottom_margin(0);
 
-            let widths = [
-                Constraint::Length(ip_width),
+            let mut widths: Vec<Constraint> = vec![Constraint::Length(ip_width)];
+            if show_ports {
+                widths.push(Constraint::Length(port_width));
+            }
+            widths.extend([
                 Constraint::Length(pkt_width),
                 Constraint::Min(8),
                 Constraint::Length(source_width),
-            ];
+            ]);
 
             let table = Table::new(rows, widths)
                 .header(header)
@@ -493,9 +547,9 @@ struct IfacePicker {
     selected: BTreeSet<String>,
 }
 
-/// Parse the destination IP from a raw Ethernet frame.
-/// Supports IPv4 and IPv6.
-fn parse_dest_ip(data: &[u8]) -> Option<IpAddr> {
+/// Parse the destination IP and optional transport port from a raw Ethernet frame.
+/// Supports IPv4 and IPv6 with TCP/UDP port extraction.
+fn parse_dest_ip(data: &[u8]) -> Option<(IpAddr, Option<u16>)> {
     if data.len() < 14 {
         return None;
     }
@@ -507,16 +561,36 @@ fn parse_dest_ip(data: &[u8]) -> Option<IpAddr> {
             if data.len() < ip_start + 20 {
                 return None;
             }
+            let ihl = (data[ip_start] & 0x0F) as usize * 4;
+            let protocol = data[ip_start + 9];
             let dst: [u8; 4] = data[ip_start + 16..ip_start + 20].try_into().ok()?;
-            Some(IpAddr::from(dst))
+            let ip = IpAddr::from(dst);
+            let port = parse_dest_port(data, ip_start + ihl, protocol);
+            Some((ip, port))
         }
         0x86DD => {
             let ip_start = 14;
             if data.len() < ip_start + 40 {
                 return None;
             }
+            let next_header = data[ip_start + 6];
             let dst: [u8; 16] = data[ip_start + 24..ip_start + 40].try_into().ok()?;
-            Some(IpAddr::from(dst))
+            let ip = IpAddr::from(dst);
+            let port = parse_dest_port(data, ip_start + 40, next_header);
+            Some((ip, port))
+        }
+        _ => None,
+    }
+}
+
+/// Extract destination port from TCP or UDP transport header.
+fn parse_dest_port(data: &[u8], transport_start: usize, protocol: u8) -> Option<u16> {
+    match protocol {
+        6 | 17 => {
+            if data.len() < transport_start + 4 {
+                return None;
+            }
+            Some(u16::from_be_bytes([data[transport_start + 2], data[transport_start + 3]]))
         }
         _ => None,
     }
