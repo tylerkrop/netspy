@@ -1,5 +1,7 @@
 # netspy
 
+> **Warning:** Everything in this repository is AI-generated.
+
 A terminal-based network monitoring tool that captures live traffic and displays destination IPs, packet counts, and resolved hostnames in a scrollable TUI table.
 
 ## Features
