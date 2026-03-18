@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 pcap = "2"
 ctrlc = "3"
+dns-lookup = "2"
